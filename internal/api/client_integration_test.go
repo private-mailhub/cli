@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -13,6 +14,25 @@ import (
 )
 
 func TestClient_요청계약(t *testing.T) {
+	t.Run("교차 origin redirect에서는 Authorization을 전달하지 않는다", func(t *testing.T) {
+		var leaked string
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			leaked = r.Header.Get("Authorization")
+			_, _ = io.WriteString(w, `{"result":"success","data":[]}`)
+		}))
+		defer target.Close()
+		source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			http.Redirect(w, req, target.URL+"/api/relay-emails", http.StatusFound)
+		}))
+		defer source.Close()
+		if _, err := api.NewClient(source.URL, "mhk_secret", "0.1.0").ListAliases(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if leaked != "" {
+			t.Fatalf("cross-origin token leaked: %q", leaked)
+		}
+	})
+
 	t.Run("성공 응답은 공통 envelope를 해석하고 인증 헤더와 User-Agent를 보낸다", func(t *testing.T) {
 		var gotAuth, gotUA string
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -63,9 +83,49 @@ func TestClient_요청계약(t *testing.T) {
 			t.Fatalf("alias=%+v err=%v", alias, err)
 		}
 	})
+	t.Run("생성 응답 description null은 nil 포인터로 보존한다", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, `{"result":"success","data":{"id":"8","relayEmail":"b@example.com","isActive":true,"description":null,"createdAt":"2026-01-01T00:00:00Z"}}`)
+		}))
+		defer server.Close()
+		alias, err := api.NewClient(server.URL, "token", "0.1.0").CreateAlias(t.Context(), "")
+		if err != nil || alias.Description != nil {
+			t.Fatalf("alias=%+v err=%v", alias, err)
+		}
+	})
+}
+
+func TestVerificationURL_보안검증(t *testing.T) {
+	t.Run("API localhost와 별도 HTTPS web host 포트를 허용한다", func(t *testing.T) {
+		if err := api.ValidateVerificationURL("https://web.example:5173/cli/authorize"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("loopback 이외 HTTP와 userinfo URL은 거부한다", func(t *testing.T) {
+		for _, raw := range []string{"http://web.example/cli/authorize", "https://user:pass@web.example/cli/authorize"} {
+			if err := api.ValidateVerificationURL(raw); err == nil {
+				t.Errorf("accepted unsafe URL: %s", raw)
+			}
+		}
+	})
 }
 
 func TestClient_DeviceAuthorization(t *testing.T) {
+	t.Run("첫 polling 전에 interval만큼 기다리고 deadline이면 요청하지 않는다", func(t *testing.T) {
+		calls := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			_, _ = io.WriteString(w, `{"result":"fail","error":"authorization_pending"}`)
+		}))
+		defer server.Close()
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+		defer cancel()
+		_, err := api.NewClient(server.URL, "", "0.1.0").PollDeviceToken(ctx, "dc", 100*time.Millisecond)
+		if err == nil || calls != 0 {
+			t.Fatalf("err=%v calls=%d", err, calls)
+		}
+	})
+
 	t.Run("pending과 slow_down을 거쳐 승인 키를 반환한다", func(t *testing.T) {
 		calls := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

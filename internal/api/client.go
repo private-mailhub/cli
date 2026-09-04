@@ -15,6 +15,8 @@ import (
 
 const DefaultBaseURL = "https://private-mailhub.com"
 
+const HTTPTimeout = 15 * time.Second
+
 type Client struct {
 	baseURL    string
 	token      string
@@ -51,15 +53,24 @@ type Alias struct {
 	ID              string  `json:"id"`
 	RelayEmail      string  `json:"relayEmail"`
 	IsActive        bool    `json:"isActive"`
-	Description     string  `json:"description"`
+	Description     *string `json:"description"`
 	ForwardCount    string  `json:"forwardCount"`
 	LastForwardedAt *string `json:"lastForwardedAt"`
 	CreatedAt       string  `json:"createdAt"`
 	UpdatedAt       *string `json:"updatedAt"`
 }
 
+type CreatedAlias struct {
+	ID         string `json:"id"`
+	RelayEmail string `json:"relayEmail"`
+	IsActive   bool   `json:"isActive"`
+	// Description is either the server-provided string or nil when the
+	// response explicitly contains JSON null.
+	Description any    `json:"description"`
+	CreatedAt   string `json:"createdAt"`
+}
+
 func (a *Alias) UnmarshalJSON(data []byte) error {
-	type alias Alias
 	var raw struct {
 		ID              json.RawMessage `json:"id"`
 		RelayEmail      json.RawMessage `json:"relayEmail"`
@@ -83,9 +94,15 @@ func (a *Alias) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("relay email: %w", err)
 	}
 	a.IsActive = raw.IsActive
-	a.Description, err = decodeString(raw.Description)
-	if err != nil {
-		return fmt.Errorf("alias description: %w", err)
+	if len(raw.Description) != 0 && string(raw.Description) != "null" {
+		description, decodeErr := decodeString(raw.Description)
+		err = decodeErr
+		if err != nil {
+			return fmt.Errorf("alias description: %w", err)
+		}
+		a.Description = &description
+	} else {
+		a.Description = nil
 	}
 	a.ForwardCount, err = decodeString(raw.ForwardCount)
 	if err != nil {
@@ -198,7 +215,7 @@ func NewClient(baseURL, token, version string) *Client {
 		baseURL:    baseURL,
 		token:      token,
 		version:    version,
-		httpClient: http.DefaultClient,
+		httpClient: newHTTPClient(),
 	}
 }
 
@@ -217,14 +234,14 @@ func (c *Client) ListAliases(ctx context.Context) ([]Alias, error) {
 	return aliases, nil
 }
 
-func (c *Client) CreateAlias(ctx context.Context, description string) (Alias, error) {
+func (c *Client) CreateAlias(ctx context.Context, description string) (CreatedAlias, error) {
 	body := map[string]string{}
 	if description != "" {
 		body["description"] = description
 	}
-	var alias Alias
+	var alias CreatedAlias
 	if err := c.doJSON(ctx, http.MethodPost, "/api/relay-emails/create", body, &alias); err != nil {
-		return Alias{}, err
+		return CreatedAlias{}, err
 	}
 	return alias, nil
 }
@@ -293,11 +310,17 @@ func (c *Client) StartDeviceAuthorization(ctx context.Context, deviceName string
 }
 
 func (c *Client) PollDeviceToken(ctx context.Context, deviceCode string, interval time.Duration) (DeviceToken, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if strings.TrimSpace(deviceCode) == "" {
 		return DeviceToken{}, errors.New("device code is required")
 	}
 	if interval <= 0 {
 		interval = 5 * time.Second
+	}
+	if err := wait(ctx, interval); err != nil {
+		return DeviceToken{}, err
 	}
 	for {
 		body := struct {
@@ -495,6 +518,60 @@ func wait(ctx context.Context, duration time.Duration) error {
 
 func (c *Client) SetHTTPClient(client *http.Client) {
 	if client != nil {
-		c.httpClient = client
+		c.httpClient = configureHTTPClient(client)
 	}
+}
+
+func ValidateVerificationURL(rawURL string) error {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil {
+		return errors.New("verification URL is invalid")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && !(scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+		return errors.New("verification URL must use HTTPS")
+	}
+	return nil
+}
+
+func newHTTPClient() *http.Client {
+	return &http.Client{Timeout: HTTPTimeout, CheckRedirect: redirectPolicy}
+}
+
+func configureHTTPClient(client *http.Client) *http.Client {
+	configured := *client
+	if configured.Timeout <= 0 || configured.Timeout > HTTPTimeout {
+		configured.Timeout = HTTPTimeout
+	}
+	configured.CheckRedirect = redirectPolicy
+	return &configured
+}
+
+func redirectPolicy(request *http.Request, previous []*http.Request) error {
+	if request.URL.User != nil {
+		return errors.New("redirect URL must not contain userinfo")
+	}
+	if len(previous) == 0 {
+		return nil
+	}
+	last := previous[len(previous)-1]
+	if sameOrigin(last.URL, request.URL) {
+		if authorization := last.Header.Get("Authorization"); authorization != "" {
+			request.Header.Set("Authorization", authorization)
+		}
+		return nil
+	}
+	request.Header.Del("Authorization")
+	return nil
+}
+
+func sameOrigin(left, right *url.URL) bool {
+	return strings.EqualFold(left.Scheme, right.Scheme) &&
+		strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		left.Port() == right.Port()
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(host)
+	return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
 }

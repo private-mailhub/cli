@@ -10,12 +10,12 @@ func NewKeychainStore() *KeychainStore {
 	return &KeychainStore{}
 }
 
-func (s *KeychainStore) Save(string) error {
+func (s *KeychainStore) Save(Credential) error {
 	return errors.New("macOS Keychain is unavailable without cgo")
 }
 
-func (s *KeychainStore) Load() string {
-	return ""
+func (s *KeychainStore) Load() (Credential, error) {
+	return Credential{}, errors.New("macOS Keychain is unavailable without cgo")
 }
 
 func (s *KeychainStore) Delete() error {

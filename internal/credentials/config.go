@@ -9,7 +9,6 @@ import (
 )
 
 type Config struct {
-	APIURL    string `json:"apiUrl,omitempty"`
 	KeyID     string `json:"keyId,omitempty"`
 	ExpiresAt string `json:"expiresAt,omitempty"`
 }

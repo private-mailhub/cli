@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/private-mailhub/mailhub-cli/internal/cli"
+	"github.com/private-mailhub/mailhub-cli/internal/credentials"
 )
 
 func run(t *testing.T, args ...string) (int, string, string) {
@@ -19,9 +20,17 @@ func run(t *testing.T, args ...string) (int, string, string) {
 }
 
 func TestCommand_기본명령(t *testing.T) {
+	t.Run("unknown command, flag, version extra arg는 모두 사용법 오류다", func(t *testing.T) {
+		for _, args := range [][]string{{"wat"}, {"version", "--wat"}, {"version", "extra"}} {
+			code, _, stderr := run(t, args...)
+			if code != 2 || stderr == "" {
+				t.Errorf("args=%v code=%d stderr=%q", args, code, stderr)
+			}
+		}
+	})
 	t.Run("version은 stdout에 버전을 출력하고 stderr는 비운다", func(t *testing.T) {
 		code, stdout, stderr := run(t, "version")
-		if code != 0 || !strings.Contains(stdout, "0.1.0") || stderr != "" {
+		if code != 0 || stdout != "mailhub 0.1.0\n" || stderr != "" {
 			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
 		}
 	})
@@ -45,6 +54,55 @@ func TestCommand_기본명령(t *testing.T) {
 		code, _, stderr := run(t, "alias", "label", "7", "업무", "--clear")
 		if code != 2 || stderr == "" {
 			t.Fatalf("code=%d stderr=%q", code, stderr)
+		}
+	})
+}
+
+func TestCommand_환경변수인증메타데이터(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("MAILHUB_CONFIG_DIR", configDir)
+	if err := credentials.SaveConfig(credentials.Config{KeyID: "old-key", ExpiresAt: "2030-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAILHUB_TOKEN", "mhk_env_secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/api-keys/current" {
+			_, _ = io.WriteString(w, `{"result":"success","data":null}`)
+			return
+		}
+		if r.URL.Path == "/api/api-keys" {
+			_, _ = io.WriteString(w, `{"result":"success","data":[{"id":"old-key","expiresAt":"2030-01-01T00:00:00Z"}]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	t.Setenv("MAILHUB_API_URL", server.URL)
+
+	t.Run("logout은 원래 config를 보존하고 환경변수 제거 안내만 stderr에 남긴다", func(t *testing.T) {
+		code, _, stderr := run(t, "auth", "logout")
+		if code != 0 || !strings.Contains(stderr, "MAILHUB_TOKEN") || strings.Contains(stderr, "mhk_env_secret") {
+			t.Fatalf("code=%d stderr=%q", code, stderr)
+		}
+		got, err := credentials.LoadConfig()
+		if err != nil || got.KeyID != "old-key" {
+			t.Fatalf("config=%+v err=%v", got, err)
+		}
+	})
+	t.Run("keys revoke도 환경변수 토큰이면 같은 key id의 config를 보존한다", func(t *testing.T) {
+		code, _, _ := run(t, "auth", "keys", "revoke", "old-key")
+		if code != 0 {
+			t.Fatalf("code=%d", code)
+		}
+		got, err := credentials.LoadConfig()
+		if err != nil || got.KeyID != "old-key" {
+			t.Fatalf("config=%+v err=%v", got, err)
+		}
+	})
+	t.Run("status는 stale config의 key id 대신 환경변수 인증을 보고한다", func(t *testing.T) {
+		code, stdout, _ := run(t, "auth", "status")
+		if code != 0 || !strings.Contains(stdout, "MAILHUB_TOKEN") || strings.Contains(stdout, "old-key") {
+			t.Fatalf("code=%d stdout=%q", code, stdout)
 		}
 	})
 }
@@ -76,6 +134,19 @@ func TestCommand_AliasAPI(t *testing.T) {
 			t.Fatalf("code=%d stderr=%q", code, stderr)
 		}
 	})
+}
+
+func TestCommand_AliasNullDescription(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"result":"success","data":[{"id":"7","relayEmail":"exact@example.com","isActive":true,"description":null,"forwardCount":"0","createdAt":"2026-01-01T00:00:00Z","updatedAt":null}]}`)
+	}))
+	defer server.Close()
+	t.Setenv("MAILHUB_API_URL", server.URL)
+	t.Setenv("MAILHUB_TOKEN", "mhk_test_secret")
+	code, stdout, stderr := run(t, "alias", "list", "--json")
+	if code != 0 || !strings.Contains(stdout, `"description":null`) || strings.Contains(stderr, "<nil>") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
 }
 
 func TestCommand_Logout(t *testing.T) {

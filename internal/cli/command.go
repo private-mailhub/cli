@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -33,6 +32,13 @@ type app struct {
 	errOut  io.Writer
 	store   credentials.Store
 	apiFlag string
+}
+
+type authState struct {
+	client     *api.Client
+	credential credentials.Credential
+	metadata   credentials.Config
+	fromEnv    bool
 }
 
 type exitError struct {
@@ -85,7 +91,10 @@ func (a *app) rootCommand() *cobra.Command {
 	}
 	root.SetOut(a.out)
 	root.SetErr(a.errOut)
-	root.PersistentFlags().StringVar(&a.apiFlag, "api-url", "", "Mailhub API base URL")
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return usageError(err)
+	})
+	root.PersistentFlags().StringVar(&a.apiFlag, "api-url", "", "Mailhub API origin")
 	root.AddCommand(a.versionCommand())
 	root.AddCommand(a.completionCommand(root))
 	root.AddCommand(a.authCommand())
@@ -99,7 +108,7 @@ func (a *app) versionCommand() *cobra.Command {
 		Short: "Print the CLI version",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			_, err := fmt.Fprintf(cmd.OutOrStdout(), "mailhub-cli %s\n", Version)
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "mailhub %s\n", Version)
 			return err
 		},
 	}
@@ -166,13 +175,13 @@ func (a *app) loginCommand() *cobra.Command {
 			}
 			client, err := a.publicClient()
 			if err != nil {
-				return apiError(err)
+				return err
 			}
 			authorization, err := client.StartDeviceAuthorization(cmd.Context(), deviceName)
 			if err != nil {
 				return apiError(err)
 			}
-			if err := platform.ValidateVerificationURL(authorization.VerificationURI, clientBaseURL(client)); err != nil {
+			if err := api.ValidateVerificationURL(authorization.VerificationURI); err != nil {
 				return apiError(err)
 			}
 			if noBrowser {
@@ -180,14 +189,19 @@ func (a *app) loginCommand() *cobra.Command {
 					return err
 				}
 			} else if err := platform.OpenBrowser(authorization.VerificationURI); err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "could not open browser: %s\n", redactSecrets(err.Error()))
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "could not open browser: %s\n", redactSecrets(err.Error()))
 				if err := printDeviceInstructions(cmd.OutOrStdout(), authorization); err != nil {
 					return err
 				}
 			}
+			pollContext, cancel := devicePollContext(cmd.Context(), authorization.ExpiresIn)
+			defer cancel()
 			interval := time.Duration(authorization.Interval) * time.Second
-			deviceToken, err := client.PollDeviceToken(cmd.Context(), authorization.DeviceCode, interval)
+			deviceToken, err := client.PollDeviceToken(pollContext, authorization.DeviceCode, interval)
 			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return authError(errors.New("device authorization expired"))
+				}
 				return deviceFlowError(err)
 			}
 			if err := a.saveCredentials(deviceToken, clientBaseURL(client)); err != nil {
@@ -208,28 +222,29 @@ func (a *app) statusCommand() *cobra.Command {
 		Short: "Show authentication status",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			token, fromEnv, err := a.resolveToken()
+			state, err := a.authClient()
 			if err != nil {
 				return err
 			}
-			if token == "" {
-				return authRequiredError()
+			metadata := credentials.Config{}
+			if !state.fromEnv {
+				metadata, err = credentials.LoadConfig()
+				if err != nil {
+					return apiError(err)
+				}
+				a.warnExpiry(metadata, false)
 			}
-			config, err := credentials.LoadConfig()
+			keys, err := state.client.ListKeys(cmd.Context())
 			if err != nil {
 				return apiError(err)
 			}
-			if !fromEnv && storedCredentialExpired(config) {
-				return authError(errors.New("stored API key has expired"))
+			if state.fromEnv {
+				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Authenticated via MAILHUB_TOKEN.")
+				return err
 			}
-			a.warnExpiry(config, fromEnv)
-			keyID, expiresAt := config.KeyID, config.ExpiresAt
+			keyID, expiresAt := statusKey(keys, metadata)
 			if keyID == "" {
-				if fromEnv {
-					_, err = fmt.Fprintln(cmd.OutOrStdout(), "Authenticated via MAILHUB_TOKEN.")
-				} else {
-					_, err = fmt.Fprintln(cmd.OutOrStdout(), "Authenticated (Keychain credential found).")
-				}
+				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Authenticated (no active API key metadata found).")
 				return err
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated\nKey ID: %s\nExpires: %s\n", keyID, expiresAt)
@@ -244,20 +259,17 @@ func (a *app) logoutCommand() *cobra.Command {
 		Short: "Revoke the current API key and clear local credentials",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			token, fromEnv, err := a.resolveToken()
+			credential, fromEnv, err := a.loadCredential()
 			if err != nil {
-				return err
+				return apiError(err)
 			}
-			if token == "" {
-				if err := credentials.DeleteConfig(); err != nil {
-					return apiError(err)
-				}
+			if credential.Token == "" {
 				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Not authenticated.")
 				return err
 			}
-			client, err := a.clientForToken(token)
+			client, err := a.clientForCredential(credential, fromEnv)
 			if err != nil {
-				return apiError(err)
+				return err
 			}
 			if fromEnv {
 				revokeErr := client.RevokeCurrentKey(cmd.Context())
@@ -266,6 +278,12 @@ func (a *app) logoutCommand() *cobra.Command {
 				}
 				if revokeErr != nil {
 					_, err = fmt.Fprintln(cmd.OutOrStdout(), "API key was already expired or revoked.")
+					if guidanceErr := printEnvTokenGuidance(cmd.ErrOrStderr()); err == nil {
+						err = guidanceErr
+					}
+					return err
+				}
+				if err := printEnvTokenGuidance(cmd.ErrOrStderr()); err != nil {
 					return err
 				}
 				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Logged out.")
@@ -278,7 +296,9 @@ func (a *app) logoutCommand() *cobra.Command {
 				if !isTerminalAuthError(revokeErr) {
 					return apiError(revokeErr)
 				}
-				_ = a.store.Delete()
+				if err := a.store.Delete(); err != nil {
+					return apiError(err)
+				}
 			}
 			if err := credentials.DeleteConfig(); err != nil {
 				return apiError(err)
@@ -296,12 +316,12 @@ func (a *app) keysListCommand() *cobra.Command {
 		Short: "List API keys",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, config, fromEnv, err := a.authClient()
+			state, err := a.authClient()
 			if err != nil {
 				return err
 			}
-			a.warnExpiry(config, fromEnv)
-			keys, err := client.ListKeys(cmd.Context())
+			a.warnExpiry(state.metadata, state.fromEnv)
+			keys, err := state.client.ListKeys(cmd.Context())
 			if err != nil {
 				return apiError(err)
 			}
@@ -323,19 +343,36 @@ func (a *app) keysRevokeCommand() *cobra.Command {
 			if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 				return usageError(errors.New("revoke requires a key id"))
 			}
-			if !isPositiveInteger(args[0]) {
-				return usageError(errors.New("key id must be a positive integer"))
-			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, config, fromEnv, err := a.authClient()
+			state, err := a.authClient()
 			if err != nil {
 				return err
 			}
-			a.warnExpiry(config, fromEnv)
-			if err := client.RevokeKey(cmd.Context(), args[0]); err != nil {
-				return apiError(err)
+			a.warnExpiry(state.metadata, state.fromEnv)
+			revokeErr := state.client.RevokeKey(cmd.Context(), args[0])
+			if revokeErr != nil && state.fromEnv && isNotFoundAPIError(revokeErr) {
+				// An environment token has no local key identity. If metadata still
+				// identifies this key and the resource endpoint is unavailable, the
+				// current-key endpoint is the safe server-side fallback.
+				metadata, metadataErr := credentials.LoadConfig()
+				if metadataErr == nil && metadata.KeyID == args[0] {
+					revokeErr = state.client.RevokeCurrentKey(cmd.Context())
+				}
+			}
+			if revokeErr != nil {
+				return apiError(revokeErr)
+			}
+			if state.metadata.KeyID == args[0] {
+				if !state.fromEnv {
+					if err := a.store.Delete(); err != nil {
+						return apiError(err)
+					}
+					if err := credentials.DeleteConfig(); err != nil {
+						return apiError(err)
+					}
+				}
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Revoked key %s.\n", args[0])
 			return err
@@ -363,12 +400,12 @@ func (a *app) aliasListCommand() *cobra.Command {
 		Short: "List relay email aliases",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, config, fromEnv, err := a.authClient()
+			state, err := a.authClient()
 			if err != nil {
 				return err
 			}
-			a.warnExpiry(config, fromEnv)
-			aliases, err := client.ListAliases(cmd.Context())
+			a.warnExpiry(state.metadata, state.fromEnv)
+			aliases, err := state.client.ListAliases(cmd.Context())
 			if err != nil {
 				return apiError(err)
 			}
@@ -393,19 +430,19 @@ func (a *app) aliasCreateCommand() *cobra.Command {
 			if utf8.RuneCountInString(label) > 100 {
 				return usageError(errors.New("label must be 100 characters or fewer"))
 			}
-			client, config, fromEnv, err := a.authClient()
+			state, err := a.authClient()
 			if err != nil {
 				return err
 			}
-			a.warnExpiry(config, fromEnv)
-			alias, err := client.CreateAlias(cmd.Context(), label)
+			a.warnExpiry(state.metadata, state.fromEnv)
+			alias, err := state.client.CreateAlias(cmd.Context(), label)
 			if err != nil {
 				return apiError(err)
 			}
 			if jsonOutput {
 				return writeJSON(cmd.OutOrStdout(), alias)
 			}
-			return printAlias(cmd.OutOrStdout(), alias)
+			return printCreatedAlias(cmd.OutOrStdout(), alias)
 		},
 	}
 	create.Flags().StringVar(&label, "label", "", "Description for the alias")
@@ -424,23 +461,23 @@ func (a *app) aliasActiveCommand(name string, active bool) *cobra.Command {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, config, fromEnv, err := a.authClient()
+			state, err := a.authClient()
 			if err != nil {
 				return err
 			}
-			a.warnExpiry(config, fromEnv)
-			id, err := a.resolveAliasID(cmd.Context(), client, args[0])
+			a.warnExpiry(state.metadata, state.fromEnv)
+			id, err := a.resolveAliasID(cmd.Context(), state.client, args[0])
 			if err != nil {
 				return err
 			}
-			if err := client.SetAliasActive(cmd.Context(), id, active); err != nil {
+			if err := state.client.SetAliasActive(cmd.Context(), id, active); err != nil {
 				return apiError(err)
 			}
-			state := "disabled"
+			stateLabel := "disabled"
 			if active {
-				state = "enabled"
+				stateLabel = "enabled"
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Alias %s %s.\n", id, state)
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Alias %s %s.\n", id, stateLabel)
 			return err
 		},
 	}
@@ -474,12 +511,12 @@ func (a *app) aliasLabelCommand() *cobra.Command {
 			if !clear && utf8.RuneCountInString(args[1]) > 100 {
 				return usageError(errors.New("label must be 100 characters or fewer"))
 			}
-			client, config, fromEnv, err := a.authClient()
+			state, err := a.authClient()
 			if err != nil {
 				return err
 			}
-			a.warnExpiry(config, fromEnv)
-			id, err := a.resolveAliasID(cmd.Context(), client, args[0])
+			a.warnExpiry(state.metadata, state.fromEnv)
+			id, err := a.resolveAliasID(cmd.Context(), state.client, args[0])
 			if err != nil {
 				return err
 			}
@@ -487,7 +524,7 @@ func (a *app) aliasLabelCommand() *cobra.Command {
 			if !clear {
 				description = args[1]
 			}
-			if err := client.UpdateAliasDescription(cmd.Context(), id, description); err != nil {
+			if err := state.client.UpdateAliasDescription(cmd.Context(), id, description); err != nil {
 				return apiError(err)
 			}
 			if clear {
@@ -519,95 +556,135 @@ func (a *app) resolveAliasID(ctx context.Context, client *api.Client, identifier
 }
 
 func (a *app) publicClient() (*api.Client, error) {
-	baseURL, err := a.baseURL()
+	baseURL, _, err := a.explicitOrigin()
 	if err != nil {
 		return nil, err
 	}
 	return api.NewClient(baseURL, "", Version), nil
 }
 
-func (a *app) authClient() (*api.Client, credentials.Config, bool, error) {
-	token, fromEnv, err := a.resolveToken()
+func (a *app) authClient() (authState, error) {
+	credential, fromEnv, err := a.loadCredential()
 	if err != nil {
-		return nil, credentials.Config{}, false, err
+		return authState{}, apiError(err)
 	}
-	if token == "" {
-		return nil, credentials.Config{}, fromEnv, authRequiredError()
+	if credential.Token == "" {
+		return authState{}, authRequiredError()
 	}
-	config, err := credentials.LoadConfig()
+	client, err := a.clientForCredential(credential, fromEnv)
 	if err != nil {
-		return nil, credentials.Config{}, fromEnv, apiError(err)
+		return authState{}, err
 	}
-	if !fromEnv && storedCredentialExpired(config) {
-		return nil, config, false, authError(errors.New("stored API key has expired"))
+	state := authState{client: client, credential: credential, fromEnv: fromEnv}
+	if !fromEnv {
+		metadata, metadataErr := credentials.LoadConfig()
+		if metadataErr != nil {
+			return authState{}, apiError(metadataErr)
+		}
+		state.metadata = metadata
 	}
-	client, err := a.clientForToken(token)
-	if err != nil {
-		return nil, config, fromEnv, apiError(err)
-	}
-	return client, config, fromEnv, nil
+	return state, nil
 }
 
-func (a *app) resolveToken() (string, bool, error) {
+func (a *app) loadCredential() (credentials.Credential, bool, error) {
 	if token, ok := os.LookupEnv("MAILHUB_TOKEN"); ok {
-		return strings.TrimSpace(token), strings.TrimSpace(token) != "", nil
+		return credentials.Credential{Token: strings.TrimSpace(token)}, true, nil
 	}
-	return credentials.ResolveToken(a.store), false, nil
+	credential, err := a.store.Load()
+	if err != nil {
+		return credentials.Credential{}, false, err
+	}
+	credential.Token = strings.TrimSpace(credential.Token)
+	return credential, false, nil
 }
 
-func (a *app) clientForToken(token string) (*api.Client, error) {
-	baseURL, err := a.baseURL()
+func (a *app) clientForCredential(credential credentials.Credential, fromEnv bool) (*api.Client, error) {
+	if fromEnv {
+		origin, _, err := a.explicitOrigin()
+		if err != nil {
+			return nil, err
+		}
+		return api.NewClient(origin, credential.Token, Version), nil
+	}
+	boundOrigin, err := credentials.NormalizeAPIOrigin(credential.APIURL)
+	if err != nil {
+		return nil, apiError(err)
+	}
+	explicitOrigin, hasExplicit, err := a.explicitOrigin()
 	if err != nil {
 		return nil, err
 	}
-	return api.NewClient(baseURL, token, Version), nil
+	if hasExplicit && explicitOrigin != boundOrigin {
+		return nil, usageError(errors.New("API URL does not match the saved credential; run `mailhub auth login` again"))
+	}
+	return api.NewClient(boundOrigin, credential.Token, Version), nil
 }
 
-func (a *app) baseURL() (string, error) {
+func (a *app) explicitOrigin() (string, bool, error) {
 	if strings.TrimSpace(a.apiFlag) != "" {
-		return normalizeBaseURL(a.apiFlag)
+		origin, err := credentials.NormalizeAPIOrigin(a.apiFlag)
+		if err != nil {
+			return "", true, usageError(err)
+		}
+		return origin, true, nil
 	}
 	if value, ok := os.LookupEnv("MAILHUB_API_URL"); ok && strings.TrimSpace(value) != "" {
-		return normalizeBaseURL(value)
+		origin, err := credentials.NormalizeAPIOrigin(value)
+		if err != nil {
+			return "", true, usageError(err)
+		}
+		return origin, true, nil
 	}
-	config, err := credentials.LoadConfig()
-	if err != nil {
-		return "", err
-	}
-	if config.APIURL != "" {
-		return normalizeBaseURL(config.APIURL)
-	}
-	return api.DefaultBaseURL, nil
+	return credentials.DefaultAPIURL, false, nil
 }
 
 func (a *app) saveCredentials(deviceToken api.DeviceToken, baseURL string) error {
-	config := credentials.Config{APIURL: baseURL, KeyID: deviceToken.KeyID, ExpiresAt: deviceToken.ExpiresAt}
-	if err := a.store.Save(deviceToken.APIKey); err != nil {
-		return apiError(errors.New("save credentials to Keychain: " + err.Error()))
+	origin, err := credentials.NormalizeAPIOrigin(baseURL)
+	if err != nil {
+		return apiError(err)
 	}
-	if err := credentials.SaveConfig(config); err != nil {
-		_ = a.store.Delete()
+	newCredential := credentials.Credential{Token: deviceToken.APIKey, APIURL: origin}
+	previousCredential, err := a.store.Load()
+	if err != nil {
+		return apiError(err)
+	}
+	previousMetadata, err := credentials.LoadConfig()
+	if err != nil {
+		return apiError(err)
+	}
+	if err := a.store.Save(newCredential); err != nil {
+		if restoreErr := credentials.Restore(a.store, previousCredential); restoreErr != nil {
+			return apiError(errors.Join(err, restoreErr))
+		}
+		return apiError(err)
+	}
+	newMetadata := credentials.Config{KeyID: deviceToken.KeyID, ExpiresAt: deviceToken.ExpiresAt}
+	if err := credentials.SaveConfig(newMetadata); err != nil {
+		restoreErr := credentials.Restore(a.store, previousCredential)
+		metadataRestoreErr := restoreMetadata(previousMetadata)
+		if restoreErr != nil || metadataRestoreErr != nil {
+			return apiError(errors.Join(err, restoreErr, metadataRestoreErr))
+		}
 		return apiError(err)
 	}
 	return nil
 }
 
-func (a *app) warnExpiry(config credentials.Config, fromEnv bool) {
-	if fromEnv || config.ExpiresAt == "" {
-		return
+func restoreMetadata(metadata credentials.Config) error {
+	if metadata.KeyID == "" && metadata.ExpiresAt == "" {
+		return credentials.DeleteConfig()
 	}
-	expiresAt, err := time.Parse(time.RFC3339, config.ExpiresAt)
-	if err == nil && credentials.ExpiringSoon(expiresAt) {
-		fmt.Fprintf(a.errOut, "warning: API key expires on %s\n", config.ExpiresAt)
-	}
+	return credentials.SaveConfig(metadata)
 }
 
-func storedCredentialExpired(config credentials.Config) bool {
-	if config.ExpiresAt == "" {
-		return false
+func (a *app) warnExpiry(metadata credentials.Config, fromEnv bool) {
+	if fromEnv || metadata.ExpiresAt == "" {
+		return
 	}
-	expiresAt, err := time.Parse(time.RFC3339, config.ExpiresAt)
-	return err == nil && !expiresAt.After(time.Now())
+	expiresAt, err := time.Parse(time.RFC3339, metadata.ExpiresAt)
+	if err == nil && credentials.ExpiringSoon(expiresAt) {
+		_, _ = fmt.Fprintf(a.errOut, "warning: API key expires on %s\n", metadata.ExpiresAt)
+	}
 }
 
 func printDeviceInstructions(out io.Writer, authorization api.DeviceAuthorization) error {
@@ -628,15 +705,27 @@ func printAliases(out io.Writer, aliases []api.Alias) error {
 		if alias.IsActive {
 			active = "on"
 		}
-		if _, err := fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\n", alias.ID, alias.RelayEmail, active, alias.Description, alias.ForwardCount, alias.CreatedAt); err != nil {
+		if _, err := fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\n", alias.ID, alias.RelayEmail, active, aliasDescription(alias), alias.ForwardCount, alias.CreatedAt); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func printAlias(out io.Writer, alias api.Alias) error {
+func aliasDescription(alias api.Alias) string {
+	if alias.Description == nil {
+		return ""
+	}
+	return *alias.Description
+}
+
+func printCreatedAlias(out io.Writer, alias api.CreatedAlias) error {
 	_, err := fmt.Fprintf(out, "Created alias %s (%s).\n", alias.ID, alias.RelayEmail)
+	return err
+}
+
+func printEnvTokenGuidance(out io.Writer) error {
+	_, err := fmt.Fprintln(out, "MAILHUB_TOKEN is set; remove it from your environment when you are finished.")
 	return err
 }
 
@@ -666,15 +755,35 @@ func writeJSON(out io.Writer, value any) error {
 	return encoder.Encode(value)
 }
 
+func statusKey(keys []api.Key, metadata credentials.Config) (string, string) {
+	if metadata.KeyID != "" {
+		for _, key := range keys {
+			if key.ID == metadata.KeyID {
+				return key.ID, key.ExpiresAt
+			}
+		}
+	}
+	for _, key := range keys {
+		if key.RevokedAt == nil {
+			return key.ID, key.ExpiresAt
+		}
+	}
+	return "", ""
+}
+
+func devicePollContext(parent context.Context, expiresIn int) (context.Context, context.CancelFunc) {
+	if expiresIn <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, time.Duration(expiresIn)*time.Second)
+}
+
 func normalizeBaseURL(rawURL string) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil {
-		return "", usageError(errors.New("API URL must be an absolute URL"))
+	origin, err := credentials.NormalizeAPIOrigin(rawURL)
+	if err != nil {
+		return "", usageError(err)
 	}
-	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
-		return "", usageError(errors.New("API URL must use HTTPS"))
-	}
-	return strings.TrimRight(parsed.String(), "/"), nil
+	return origin, nil
 }
 
 func hostname() string {
@@ -704,11 +813,6 @@ func isPositiveInteger(value string) bool {
 		}
 	}
 	return false
-}
-
-func isLoopbackHost(host string) bool {
-	host = strings.ToLower(host)
-	return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
 }
 
 func usageError(err error) error {
@@ -751,6 +855,11 @@ func isTerminalAuthError(err error) bool {
 	return false
 }
 
+func isNotFoundAPIError(err error) bool {
+	var apiErr *api.APIError
+	return errors.As(err, &apiErr) && apiErr.Status == 404
+}
+
 var tokenPattern = regexp.MustCompile(`(?i)mhk_[A-Za-z0-9_-]+`)
 
 func redactSecrets(value string) string {
@@ -762,5 +871,29 @@ func exitCode(err error) int {
 	if errors.As(err, &coded) && coded.code != 0 {
 		return coded.code
 	}
+	if isCobraUsageError(err) {
+		return ExitUsage
+	}
 	return ExitAPI
+}
+
+func isCobraUsageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"unknown command",
+		"unknown flag",
+		"unknown shorthand flag",
+		"flag needs an argument",
+		"requires",
+		"accepts",
+		"arg(s)",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }

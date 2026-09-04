@@ -26,22 +26,8 @@ func OpenBrowser(rawURL string) error {
 	return exec.Command(command, rawURL).Run()
 }
 
-func ValidateVerificationURL(rawURL, apiBaseURL string) error {
-	if strings.TrimSpace(apiBaseURL) == "" {
-		return validateURL(rawURL, "")
-	}
-	base, err := url.Parse(apiBaseURL)
-	if err != nil {
-		return fmt.Errorf("invalid API URL: %w", err)
-	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid verification URL: %w", err)
-	}
-	if parsed.Hostname() != base.Hostname() || parsed.Port() != base.Port() {
-		return fmt.Errorf("verification URL host does not match API host")
-	}
-	return validateURL(rawURL, base.Scheme)
+func ValidateVerificationURL(rawURL, _ string) error {
+	return validateURL(rawURL, "")
 }
 
 func validateURL(rawURL, baseScheme string) error {
