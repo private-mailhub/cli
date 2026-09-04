@@ -111,6 +111,17 @@ func TestVerificationURL_보안검증(t *testing.T) {
 }
 
 func TestClient_DeviceAuthorization(t *testing.T) {
+	t.Run("HTTP 요청 timeout은 전체 device deadline과 구분되는 context 오류를 반환한다", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { time.Sleep(50 * time.Millisecond) }))
+		defer server.Close()
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
+		defer cancel()
+		_, err := api.NewClient(server.URL, "", "0.1.0").StartDeviceAuthorization(ctx, "Mac")
+		if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
 	t.Run("첫 polling 전에 interval만큼 기다리고 deadline이면 요청하지 않는다", func(t *testing.T) {
 		calls := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +186,7 @@ func TestClient_키와별칭(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			paths = append(paths, r.Method+" "+r.URL.Path)
 			if r.Method == http.MethodGet {
-				_, _ = io.WriteString(w, `{"result":"success","data":[{"id":"k1","expiresAt":"2030-01-01T00:00:00Z","revokedAt":null,"scopes":["relay:read"]}]}`)
+				_, _ = io.WriteString(w, `{"result":"success","data":[{"id":"1","expiresAt":"2030-01-01T00:00:00Z","revokedAt":null,"scopes":["relay:read"]}]}`)
 				return
 			}
 			_, _ = io.WriteString(w, `{"result":"success","data":null}`)
@@ -183,13 +194,13 @@ func TestClient_키와별칭(t *testing.T) {
 		defer server.Close()
 		client := api.NewClient(server.URL, "token", "0.1.0")
 		keys, err := client.ListKeys(t.Context())
-		if err != nil || len(keys) != 1 || keys[0].ID != "k1" {
+		if err != nil || len(keys) != 1 || keys[0].ID != "1" {
 			t.Fatalf("keys=%+v err=%v", keys, err)
 		}
-		if err := client.RevokeKey(t.Context(), "k1"); err != nil {
+		if err := client.RevokeKey(t.Context(), "1"); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Join(paths, ",") != "GET /api/api-keys,DELETE /api/api-keys/k1" {
+		if strings.Join(paths, ",") != "GET /api/api-keys,DELETE /api/api-keys/1" {
 			t.Fatalf("paths=%v", paths)
 		}
 	})

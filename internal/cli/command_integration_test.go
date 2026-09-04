@@ -58,20 +58,59 @@ func TestCommand_기본명령(t *testing.T) {
 	})
 }
 
+func TestCommand_KeyRevokeValidation(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("MAILHUB_API_URL", server.URL)
+	t.Setenv("MAILHUB_TOKEN", "mhk_1_secret")
+	for _, id := range []string{"abc", "0"} {
+		code, _, _ := run(t, "auth", "keys", "revoke", id)
+		if code != 2 {
+			t.Errorf("id=%s code=%d", id, code)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("invalid revoke made %d requests", requests)
+	}
+}
+
+func TestCommand_KeyRevokeDoesNotFallbackToCurrent(t *testing.T) {
+	paths := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		if r.URL.Path == "/api/api-keys/1" {
+			http.Error(w, `{"result":"fail","error":"not_found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, "unexpected fallback", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("MAILHUB_API_URL", server.URL)
+	t.Setenv("MAILHUB_TOKEN", "mhk_1_secret")
+	code, _, _ := run(t, "auth", "keys", "revoke", "1")
+	if code != 1 || strings.Contains(strings.Join(paths, ","), "/current") {
+		t.Fatalf("code=%d paths=%v", code, paths)
+	}
+}
+
 func TestCommand_환경변수인증메타데이터(t *testing.T) {
 	configDir := t.TempDir()
 	t.Setenv("MAILHUB_CONFIG_DIR", configDir)
-	if err := credentials.SaveConfig(credentials.Config{KeyID: "old-key", ExpiresAt: "2030-01-01T00:00:00Z"}); err != nil {
+	if err := credentials.SaveConfig(credentials.Config{KeyID: "1", ExpiresAt: "2030-01-01T00:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("MAILHUB_TOKEN", "mhk_env_secret")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/api-keys/current" {
+		if r.URL.Path == "/api/api-keys/current" || r.URL.Path == "/api/api-keys/1" {
 			_, _ = io.WriteString(w, `{"result":"success","data":null}`)
 			return
 		}
 		if r.URL.Path == "/api/api-keys" {
-			_, _ = io.WriteString(w, `{"result":"success","data":[{"id":"old-key","expiresAt":"2030-01-01T00:00:00Z"}]}`)
+			_, _ = io.WriteString(w, `{"result":"success","data":[{"id":"1","expiresAt":"2030-01-01T00:00:00Z"}]}`)
 			return
 		}
 		http.NotFound(w, r)
@@ -85,23 +124,23 @@ func TestCommand_환경변수인증메타데이터(t *testing.T) {
 			t.Fatalf("code=%d stderr=%q", code, stderr)
 		}
 		got, err := credentials.LoadConfig()
-		if err != nil || got.KeyID != "old-key" {
+		if err != nil || got.KeyID != "1" {
 			t.Fatalf("config=%+v err=%v", got, err)
 		}
 	})
 	t.Run("keys revoke도 환경변수 토큰이면 같은 key id의 config를 보존한다", func(t *testing.T) {
-		code, _, _ := run(t, "auth", "keys", "revoke", "old-key")
+		code, _, _ := run(t, "auth", "keys", "revoke", "1")
 		if code != 0 {
 			t.Fatalf("code=%d", code)
 		}
 		got, err := credentials.LoadConfig()
-		if err != nil || got.KeyID != "old-key" {
+		if err != nil || got.KeyID != "1" {
 			t.Fatalf("config=%+v err=%v", got, err)
 		}
 	})
 	t.Run("status는 stale config의 key id 대신 환경변수 인증을 보고한다", func(t *testing.T) {
 		code, stdout, _ := run(t, "auth", "status")
-		if code != 0 || !strings.Contains(stdout, "MAILHUB_TOKEN") || strings.Contains(stdout, "old-key") {
+		if code != 0 || !strings.Contains(stdout, "MAILHUB_TOKEN") || strings.Contains(stdout, "Key ID: 1") {
 			t.Fatalf("code=%d stdout=%q", code, stdout)
 		}
 	})

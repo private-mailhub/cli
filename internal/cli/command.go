@@ -199,7 +199,7 @@ func (a *app) loginCommand() *cobra.Command {
 			interval := time.Duration(authorization.Interval) * time.Second
 			deviceToken, err := client.PollDeviceToken(pollContext, authorization.DeviceCode, interval)
 			if err != nil {
-				if errors.Is(err, context.DeadlineExceeded) {
+				if pollContext.Err() == context.DeadlineExceeded {
 					return authError(errors.New("device authorization expired"))
 				}
 				return deviceFlowError(err)
@@ -242,7 +242,7 @@ func (a *app) statusCommand() *cobra.Command {
 				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Authenticated via MAILHUB_TOKEN.")
 				return err
 			}
-			keyID, expiresAt := statusKey(keys, metadata)
+			keyID, expiresAt := statusKey(keys, metadata, state.credential.Token)
 			if keyID == "" {
 				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Authenticated (no active API key metadata found).")
 				return err
@@ -343,6 +343,9 @@ func (a *app) keysRevokeCommand() *cobra.Command {
 			if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 				return usageError(errors.New("revoke requires a key id"))
 			}
+			if !isPositiveInteger(args[0]) {
+				return usageError(errors.New("key id must be a positive integer"))
+			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -351,18 +354,8 @@ func (a *app) keysRevokeCommand() *cobra.Command {
 				return err
 			}
 			a.warnExpiry(state.metadata, state.fromEnv)
-			revokeErr := state.client.RevokeKey(cmd.Context(), args[0])
-			if revokeErr != nil && state.fromEnv && isNotFoundAPIError(revokeErr) {
-				// An environment token has no local key identity. If metadata still
-				// identifies this key and the resource endpoint is unavailable, the
-				// current-key endpoint is the safe server-side fallback.
-				metadata, metadataErr := credentials.LoadConfig()
-				if metadataErr == nil && metadata.KeyID == args[0] {
-					revokeErr = state.client.RevokeCurrentKey(cmd.Context())
-				}
-			}
-			if revokeErr != nil {
-				return apiError(revokeErr)
+			if err := state.client.RevokeKey(cmd.Context(), args[0]); err != nil {
+				return apiError(err)
 			}
 			if state.metadata.KeyID == args[0] {
 				if !state.fromEnv {
@@ -755,20 +748,58 @@ func writeJSON(out io.Writer, value any) error {
 	return encoder.Encode(value)
 }
 
-func statusKey(keys []api.Key, metadata credentials.Config) (string, string) {
-	if metadata.KeyID != "" {
+func statusKey(keys []api.Key, metadata credentials.Config, token string) (string, string) {
+	publicID := apiKeyPublicID(token)
+	if publicID != "" {
 		for _, key := range keys {
-			if key.ID == metadata.KeyID {
+			if key.PublicID == publicID && key.RevokedAt == nil {
 				return key.ID, key.ExpiresAt
 			}
 		}
 	}
-	for _, key := range keys {
-		if key.RevokedAt == nil {
-			return key.ID, key.ExpiresAt
+	if metadata.KeyID != "" {
+		for _, key := range keys {
+			if key.ID == metadata.KeyID && key.RevokedAt == nil {
+				return key.ID, key.ExpiresAt
+			}
 		}
 	}
 	return "", ""
+}
+
+func apiKeyPublicID(token string) string {
+	const (
+		prefixLength   = len("mhk_")
+		publicIDLength = 22
+		secretLength   = 43
+	)
+	if len(token) != prefixLength+publicIDLength+1+secretLength || !strings.HasPrefix(token, "mhk_") {
+		return ""
+	}
+	if token[prefixLength+publicIDLength] != '_' {
+		return ""
+	}
+	publicID := token[prefixLength : prefixLength+publicIDLength]
+	secret := token[prefixLength+publicIDLength+1:]
+	if !isBase64URL(publicID) || !isBase64URL(secret) {
+		return ""
+	}
+	return publicID
+}
+
+func isBase64URL(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if (character < 'A' || character > 'Z') &&
+			(character < 'a' || character > 'z') &&
+			(character < '0' || character > '9') &&
+			character != '-' && character != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 func devicePollContext(parent context.Context, expiresIn int) (context.Context, context.CancelFunc) {
@@ -853,11 +884,6 @@ func isTerminalAuthError(err error) bool {
 		return apiErr.Code == "API_KEY_EXPIRED" || apiErr.Code == "API_KEY_REVOKED" || apiErr.Code == "access_denied" || apiErr.Code == "expired_token" || apiErr.Status == 401
 	}
 	return false
-}
-
-func isNotFoundAPIError(err error) bool {
-	var apiErr *api.APIError
-	return errors.As(err, &apiErr) && apiErr.Status == 404
 }
 
 var tokenPattern = regexp.MustCompile(`(?i)mhk_[A-Za-z0-9_-]+`)
