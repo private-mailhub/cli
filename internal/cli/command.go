@@ -28,10 +28,11 @@ const (
 )
 
 type app struct {
-	out     io.Writer
-	errOut  io.Writer
-	store   credentials.Store
-	apiFlag string
+	out         io.Writer
+	errOut      io.Writer
+	store       credentials.Store
+	apiFlag     string
+	openBrowser func(string) error
 }
 
 type authState struct {
@@ -68,9 +69,10 @@ func Execute(args []string, stdout, stderr io.Writer) int {
 		stderr = io.Discard
 	}
 	application := &app{
-		out:    stdout,
-		errOut: stderr,
-		store:  credentials.NewKeychainStore(),
+		out:         stdout,
+		errOut:      stderr,
+		store:       credentials.NewKeychainStore(),
+		openBrowser: platform.OpenBrowser,
 	}
 	root := application.rootCommand()
 	root.SetArgs(args)
@@ -184,14 +186,16 @@ func (a *app) loginCommand() *cobra.Command {
 			if err := api.ValidateVerificationURL(authorization.VerificationURI); err != nil {
 				return apiError(err)
 			}
-			if noBrowser {
-				if err := printDeviceInstructions(cmd.OutOrStdout(), authorization); err != nil {
-					return err
+			if err := printDeviceInstructions(cmd.OutOrStdout(), authorization); err != nil {
+				return err
+			}
+			if !noBrowser {
+				openBrowser := a.openBrowser
+				if openBrowser == nil {
+					openBrowser = platform.OpenBrowser
 				}
-			} else if err := platform.OpenBrowser(authorization.VerificationURI); err != nil {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "could not open browser: %s\n", redactSecrets(err.Error()))
-				if err := printDeviceInstructions(cmd.OutOrStdout(), authorization); err != nil {
-					return err
+				if err := openBrowser(authorization.VerificationURI); err != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "could not open browser: %s\n", redactSecrets(err.Error()))
 				}
 			}
 			pollContext, cancel := devicePollContext(cmd.Context(), authorization.ExpiresIn)
