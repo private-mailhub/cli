@@ -10,12 +10,12 @@
 
 <p align="center">
   <a href="https://private-mailhub.com">Mailhub</a> ·
-  <a href="https://github.com/private-mailhub/mailhub-cli">Source</a> ·
-  <a href="https://github.com/private-mailhub/mailhub-cli/issues">Issues</a>
+  <a href="https://github.com/private-mailhub/cli">Source</a> ·
+  <a href="https://github.com/private-mailhub/cli/issues">Issues</a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/github/actions/workflow/status/private-mailhub/mailhub-cli/ci.yml?branch=main&label=CI" alt="CI status" />
+  <img src="https://img.shields.io/github/actions/workflow/status/private-mailhub/cli/ci.yml?branch=main&label=CI" alt="CI status" />
   <img src="https://img.shields.io/badge/Go-1.27-00ADD8.svg" alt="Go 1.27" />
   <img src="https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20amd64-lightgrey.svg" alt="Supported platforms: macOS arm64 and amd64" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="AGPL-3.0 license" /></a>
@@ -76,17 +76,33 @@ server.
 Homebrew builds the CLI from the tagged Go source for your Mac:
 
 ```bash
-brew install private-mailhub/tap/mailhub
+brew tap private-mailhub/cli https://github.com/private-mailhub/cli.git
+brew install private-mailhub/cli/mailhub
 mailhub version
 ```
+
+The formula lives in [`Formula/mailhub.rb`](Formula/mailhub.rb) in this repository. The explicit tap
+URL is required because this repository is named `cli`, without Homebrew's usual
+`homebrew-` prefix. Homebrew updates the tap with `brew update`.
+
+If you installed `mailhub` from the former `private-mailhub/tap` repository, switch to this tap:
+
+```bash
+brew uninstall private-mailhub/tap/mailhub
+brew untap private-mailhub/tap
+brew tap private-mailhub/cli https://github.com/private-mailhub/cli.git
+brew install private-mailhub/cli/mailhub
+```
+
+Uninstalling the formula does not remove the CLI's Keychain credential or configuration file.
 
 ### Build from source
 
 Clone the repository and build the binary:
 
 ```bash
-git clone https://github.com/private-mailhub/mailhub-cli.git
-cd mailhub-cli
+git clone https://github.com/private-mailhub/cli.git
+cd cli
 
 go build -trimpath -o mailhub ./cmd/mailhub
 ./mailhub version
@@ -102,6 +118,8 @@ If your Go bin directory is already on `PATH`, you can install the command direc
 go install github.com/private-mailhub/mailhub-cli/cmd/mailhub@main
 mailhub version
 ```
+
+The Go module keeps its original `mailhub-cli` path for compatibility after the repository rename.
 
 Prebuilt binaries are not published. Homebrew builds from source; you can also build or install the
 CLI with Go directly.
@@ -308,7 +326,21 @@ go build -trimpath -o mailhub ./cmd/mailhub
 ```
 
 The same checks run in GitHub Actions. CI builds macOS binaries for both Apple Silicon (`darwin/arm64`)
-and Intel (`darwin/amd64`).
+and Intel (`darwin/amd64`), and audits, builds, and tests the Homebrew formula.
+
+### Publish a Homebrew update
+
+After tagging and publishing a CLI release, update the source tag and SHA-256 checksum in
+`Formula/mailhub.rb`. Calculate the checksum from the release's GitHub source archive. Audit and
+build the formula from source before merging the update:
+
+```bash
+brew audit --strict private-mailhub/cli/mailhub
+brew install --build-from-source private-mailhub/cli/mailhub
+brew test private-mailhub/cli/mailhub
+```
+
+The formula version comes from the tag in its source URL.
 
 ## Contributing
 
