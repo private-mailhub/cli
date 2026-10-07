@@ -32,7 +32,7 @@ terminal.
 
 This CLI uses a device-authorization and API-key contract provided by Mailhub's
 [`backend`](https://github.com/private-mailhub/backend) service, with browser approval provided by
-[`client-web`](https://github.com/private-mailhub/client-web). The related backend and frontend pull
+[`frontend`](https://github.com/private-mailhub/frontend). The related backend and frontend pull
 requests add these server and approval flows. Until both changes are merged and deployed together,
 authentication, API-key, and alias commands cannot be used end-to-end against the production service.
 
