@@ -3,6 +3,10 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -193,6 +197,15 @@ type DeviceAuthorization struct {
 	VerificationURI string `json:"verificationUri"`
 	ExpiresIn       int    `json:"expiresIn"`
 	Interval        int    `json:"interval"`
+	pollSecret      string
+}
+
+func (DeviceAuthorization) String() string {
+	return "DeviceAuthorization{redacted}"
+}
+
+func (DeviceAuthorization) GoString() string {
+	return "DeviceAuthorization{redacted}"
 }
 
 type DeviceToken struct {
@@ -290,14 +303,21 @@ func (c *Client) StartDeviceAuthorization(ctx context.Context, deviceName string
 	if deviceName == "" {
 		return DeviceAuthorization{}, errors.New("device name is required")
 	}
+	pollProof, err := newPollProof()
+	if err != nil {
+		return DeviceAuthorization{}, err
+	}
+	pollSecretHash := sha256.Sum256([]byte(pollProof))
 	body := struct {
-		ClientName string `json:"clientName"`
-		DeviceName string `json:"deviceName"`
-		CLIVersion string `json:"cliVersion"`
+		ClientName     string `json:"clientName"`
+		DeviceName     string `json:"deviceName"`
+		CLIVersion     string `json:"cliVersion"`
+		PollSecretHash string `json:"pollSecretHash"`
 	}{
-		ClientName: "mailhub-cli",
-		DeviceName: deviceName,
-		CLIVersion: c.version,
+		ClientName:     "mailhub-cli",
+		DeviceName:     deviceName,
+		CLIVersion:     c.version,
+		PollSecretHash: hex.EncodeToString(pollSecretHash[:]),
 	}
 	var authorization DeviceAuthorization
 	if err := c.doJSON(ctx, http.MethodPost, "/api/auth/cli/device", body, &authorization); err != nil {
@@ -306,15 +326,19 @@ func (c *Client) StartDeviceAuthorization(ctx context.Context, deviceName string
 	if authorization.DeviceCode == "" || authorization.VerificationURI == "" {
 		return DeviceAuthorization{}, errors.New("server returned an incomplete device authorization")
 	}
+	authorization.pollSecret = pollProof
 	return authorization, nil
 }
 
-func (c *Client) PollDeviceToken(ctx context.Context, deviceCode string, interval time.Duration) (DeviceToken, error) {
+func (c *Client) PollDeviceToken(ctx context.Context, authorization DeviceAuthorization, interval time.Duration) (DeviceToken, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if strings.TrimSpace(deviceCode) == "" {
+	if strings.TrimSpace(authorization.DeviceCode) == "" {
 		return DeviceToken{}, errors.New("device code is required")
+	}
+	if strings.TrimSpace(authorization.pollSecret) == "" {
+		return DeviceToken{}, errors.New("device poll proof is missing")
 	}
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -325,7 +349,11 @@ func (c *Client) PollDeviceToken(ctx context.Context, deviceCode string, interva
 	for {
 		body := struct {
 			DeviceCode string `json:"deviceCode"`
-		}{DeviceCode: deviceCode}
+			PollSecret string `json:"pollSecret"`
+		}{
+			DeviceCode: authorization.DeviceCode,
+			PollSecret: authorization.pollSecret,
+		}
 		var token DeviceToken
 		err := c.doJSON(ctx, http.MethodPost, "/api/auth/cli/device/token", body, &token)
 		if err == nil {
@@ -352,6 +380,14 @@ func (c *Client) PollDeviceToken(ctx context.Context, deviceCode string, interva
 			return DeviceToken{}, err
 		}
 	}
+}
+
+func newPollProof() (string, error) {
+	proof := make([]byte, 32)
+	if _, err := rand.Read(proof); err != nil {
+		return "", fmt.Errorf("generate device poll proof: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(proof), nil
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body any, output any) error {
@@ -555,14 +591,31 @@ func redirectPolicy(request *http.Request, previous []*http.Request) error {
 		return nil
 	}
 	last := previous[len(previous)-1]
-	if sameOrigin(last.URL, request.URL) {
-		if authorization := last.Header.Get("Authorization"); authorization != "" {
-			request.Header.Set("Authorization", authorization)
+	if isHTTPSDowngrade(last.URL, request.URL) {
+		return errors.New("redirect must not downgrade HTTPS")
+	}
+	if !sameOrigin(last.URL, request.URL) {
+		request.Header.Del("Authorization")
+		if hasRequestBody(request) {
+			return errors.New("cross-origin redirect must not carry a request body")
 		}
 		return nil
 	}
-	request.Header.Del("Authorization")
+	if authorization := last.Header.Get("Authorization"); authorization != "" {
+		request.Header.Set("Authorization", authorization)
+	}
 	return nil
+}
+
+func hasRequestBody(request *http.Request) bool {
+	return request.Body != nil && request.Body != http.NoBody
+}
+
+func isHTTPSDowngrade(source, target *url.URL) bool {
+	if !strings.EqualFold(source.Scheme, "https") {
+		return false
+	}
+	return !strings.EqualFold(target.Scheme, "https")
 }
 
 func sameOrigin(left, right *url.URL) bool {

@@ -2,11 +2,16 @@ package api_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,66 +117,215 @@ func TestVerificationURL_보안검증(t *testing.T) {
 
 func TestClient_DeviceAuthorization(t *testing.T) {
 	t.Run("HTTP 요청 timeout은 전체 device deadline과 구분되는 context 오류를 반환한다", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { time.Sleep(50 * time.Millisecond) }))
-		defer server.Close()
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
-		defer cancel()
-		_, err := api.NewClient(server.URL, "", "0.1.0").StartDeviceAuthorization(ctx, "Mac")
-		if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
-			t.Fatalf("err=%v", err)
-		}
-	})
-
-	t.Run("첫 polling 전에 interval만큼 기다리고 deadline이면 요청하지 않는다", func(t *testing.T) {
-		calls := 0
+		var pollCalls atomic.Int64
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			calls++
-			_, _ = io.WriteString(w, `{"result":"fail","error":"authorization_pending"}`)
-		}))
-		defer server.Close()
-		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
-		defer cancel()
-		_, err := api.NewClient(server.URL, "", "0.1.0").PollDeviceToken(ctx, "dc", 100*time.Millisecond)
-		if err == nil || calls != 0 {
-			t.Fatalf("err=%v calls=%d", err, calls)
-		}
-	})
-
-	t.Run("pending과 slow_down을 거쳐 승인 키를 반환한다", func(t *testing.T) {
-		calls := 0
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			calls++
 			if r.URL.Path == "/api/auth/cli/device" {
 				_, _ = io.WriteString(w, `{"result":"success","data":{"deviceCode":"dc","userCode":"UC","verificationUri":"https://private-mailhub.com/cli/authorize","expiresIn":600,"interval":0}}`)
 				return
 			}
-			if calls == 2 {
+			pollCalls.Add(1)
+			time.Sleep(50 * time.Millisecond)
+		}))
+		defer server.Close()
+		client := api.NewClient(server.URL, "", "0.1.0")
+		authorization, err := client.StartDeviceAuthorization(t.Context(), "Mac")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
+		defer cancel()
+		_, err = client.PollDeviceToken(ctx, authorization, time.Millisecond)
+		if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+			t.Fatalf("err=%v", err)
+		}
+		if pollCalls.Load() != 1 {
+			t.Fatalf("poll calls=%d, want 1", pollCalls.Load())
+		}
+	})
+
+	t.Run("첫 polling 전에 interval만큼 기다리고 deadline이면 요청하지 않는다", func(t *testing.T) {
+		var pollCalls atomic.Int64
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/auth/cli/device" {
+				_, _ = io.WriteString(w, `{"result":"success","data":{"deviceCode":"dc","userCode":"UC","verificationUri":"https://private-mailhub.com/cli/authorize","expiresIn":600,"interval":0}}`)
+				return
+			}
+			pollCalls.Add(1)
+			_, _ = io.WriteString(w, `{"result":"fail","error":"authorization_pending"}`)
+		}))
+		defer server.Close()
+		client := api.NewClient(server.URL, "", "0.1.0")
+		authorization, err := client.StartDeviceAuthorization(t.Context(), "Mac")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+		defer cancel()
+		_, err = client.PollDeviceToken(ctx, authorization, 100*time.Millisecond)
+		if err == nil || pollCalls.Load() != 0 {
+			t.Fatalf("err=%v poll calls=%d", err, pollCalls.Load())
+		}
+	})
+
+	t.Run("교차 origin 307 토큰 리디렉션은 외부 호스트에 요청하지 않는다", func(t *testing.T) {
+		var sourceTokenRequests atomic.Int64
+		var redirectTargetRequests atomic.Int64
+		redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			redirectTargetRequests.Add(1)
+			_, _ = io.WriteString(w, `{"result":"success","data":{"apiKey":"mhk_raw","keyId":"k1","expiresAt":"2030-01-01T00:00:00Z","scopes":["relay:read"]}}`)
+		}))
+		defer redirectTarget.Close()
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/auth/cli/device":
+				_, _ = io.WriteString(w, `{"result":"success","data":{"deviceCode":"dc","userCode":"UC","verificationUri":"https://private-mailhub.com/cli/authorize","expiresIn":600,"interval":0}}`)
+			case "/api/auth/cli/device/token":
+				sourceTokenRequests.Add(1)
+				http.Redirect(w, r, redirectTarget.URL+"/api/auth/cli/device/token", http.StatusTemporaryRedirect)
+			default:
+				t.Errorf("unexpected source request path: %s", r.URL.Path)
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		client := api.NewClient(server.URL, "", "0.1.0")
+		authorization, err := client.StartDeviceAuthorization(t.Context(), "Mac")
+		if err != nil {
+			t.Fatal("start device authorization failed")
+		}
+		_, pollErr := client.PollDeviceToken(t.Context(), authorization, time.Millisecond)
+		if pollErr == nil || !strings.Contains(pollErr.Error(), "cross-origin redirect must not carry a request body") {
+			t.Fatal("poll did not return the cross-origin request-body redirect-policy error")
+		}
+		if requests := sourceTokenRequests.Load(); requests != 1 {
+			t.Fatalf("source token endpoint received %d request(s), want exactly one", requests)
+		}
+
+		if requests := redirectTargetRequests.Load(); requests != 0 {
+			t.Fatalf("cross-origin redirect target received %d request(s)", requests)
+		}
+	})
+
+	t.Run("poll proof는 start commitment와 일치하고 모든 polling에서 동일하게 유지된다", func(t *testing.T) {
+		pollCalls := 0
+		var startBody map[string]json.RawMessage
+		var startBodyRaw string
+		var pollSecrets []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/auth/cli/device" {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read start request body: %v", err)
+					http.Error(w, "bad request", http.StatusBadRequest)
+					return
+				}
+				startBodyRaw = string(body)
+				if err := json.Unmarshal(body, &startBody); err != nil {
+					t.Errorf("decode start request body: %v", err)
+					http.Error(w, "bad request", http.StatusBadRequest)
+					return
+				}
+				_, _ = io.WriteString(w, `{"result":"success","data":{"deviceCode":"dc","userCode":"UC","verificationUri":"https://private-mailhub.com/cli/authorize","expiresIn":600,"interval":0}}`)
+				return
+			}
+			pollCalls++
+			var requestBody struct {
+				DeviceCode string `json:"deviceCode"`
+				PollSecret string `json:"pollSecret"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+				t.Errorf("decode poll request body: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if requestBody.DeviceCode != "dc" {
+				t.Errorf("poll device code=%q, want dc", requestBody.DeviceCode)
+			}
+			pollSecrets = append(pollSecrets, requestBody.PollSecret)
+			if pollCalls == 1 {
 				_, _ = io.WriteString(w, `{"result":"fail","error":"authorization_pending"}`)
 				return
 			}
-			if calls == 3 {
+			if pollCalls == 2 {
 				_, _ = io.WriteString(w, `{"result":"fail","error":"slow_down"}`)
 				return
 			}
 			_, _ = io.WriteString(w, `{"result":"success","data":{"apiKey":"mhk_raw","keyId":"k1","expiresAt":"2030-01-01T00:00:00Z","scopes":["relay:read"]}}`)
 		}))
 		defer server.Close()
-		start, err := api.NewClient(server.URL, "", "0.1.0").StartDeviceAuthorization(t.Context(), "Mac")
+		client := api.NewClient(server.URL, "", "0.1.0")
+		start, err := client.StartDeviceAuthorization(t.Context(), "Mac")
 		if err != nil || start.DeviceCode != "dc" {
-			t.Fatalf("start=%+v err=%v", start, err)
+			t.Fatalf("device authorization was incomplete or failed: code present=%t err=%v", start.DeviceCode != "", err)
 		}
-		result, err := api.NewClient(server.URL, "", "0.1.0").PollDeviceToken(t.Context(), "dc", time.Millisecond)
+		result, err := client.PollDeviceToken(t.Context(), start, time.Millisecond)
 		if err != nil || result.APIKey != "mhk_raw" || result.KeyID != "k1" {
 			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		if len(startBody) == 0 || startBody["pollSecretHash"] == nil {
+			t.Fatalf("start request did not include pollSecretHash: %q", startBodyRaw)
+		}
+		if _, ok := startBody["pollSecret"]; ok {
+			t.Fatalf("start request exposed raw poll proof: %q", startBodyRaw)
+		}
+		if len(pollSecrets) != 3 || pollSecrets[0] == "" {
+			t.Fatalf("poll request count=%d or proof missing, want three requests with a proof", len(pollSecrets))
+		}
+		for _, secret := range pollSecrets[1:] {
+			if secret != pollSecrets[0] {
+				t.Fatal("poll proof changed between requests")
+			}
+		}
+		if len(pollSecrets[0]) != 43 {
+			t.Fatalf("poll proof length=%d, want a 43-character base64url value", len(pollSecrets[0]))
+		}
+		decodedProof, err := base64.RawURLEncoding.DecodeString(pollSecrets[0])
+		if err != nil || len(decodedProof) != 32 || base64.RawURLEncoding.EncodeToString(decodedProof) != pollSecrets[0] {
+			t.Fatal("poll proof was not a canonical 32-byte base64url value")
+		}
+		if strings.Contains(startBodyRaw, pollSecrets[0]) {
+			t.Fatalf("start request included raw poll proof: %q", startBodyRaw)
+		}
+		var receivedHash string
+		if err := json.Unmarshal(startBody["pollSecretHash"], &receivedHash); err != nil {
+			t.Fatalf("decode start pollSecretHash: %v", err)
+		}
+		proofHash := sha256.Sum256([]byte(pollSecrets[0]))
+		if receivedHash != hex.EncodeToString(proofHash[:]) {
+			t.Fatal("start pollSecretHash does not match the SHA-256 of the poll proof")
+		}
+		serializedAuthorization, err := json.Marshal(start)
+		if err != nil {
+			t.Fatalf("marshal device authorization: %v", err)
+		}
+		if strings.Contains(string(serializedAuthorization), "pollSecret") || strings.Contains(string(serializedAuthorization), pollSecrets[0]) {
+			t.Fatal("device authorization JSON exposed the poll proof")
+		}
+		for _, format := range []string{"%v", "%+v", "%#v"} {
+			if strings.Contains(fmt.Sprintf(format, start), pollSecrets[0]) {
+				t.Fatalf("device authorization formatting with %q exposed the poll proof", format)
+			}
 		}
 	})
 
 	t.Run("거부와 만료는 인증 오류로 구분된다", func(t *testing.T) {
 		for _, code := range []string{"access_denied", "expired_token"} {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/auth/cli/device" {
+					_, _ = io.WriteString(w, `{"result":"success","data":{"deviceCode":"dc","userCode":"UC","verificationUri":"https://private-mailhub.com/cli/authorize","expiresIn":600,"interval":0}}`)
+					return
+				}
 				_, _ = io.WriteString(w, `{"result":"fail","error":"`+code+`"}`)
 			}))
-			_, err := api.NewClient(server.URL, "", "0.1.0").PollDeviceToken(t.Context(), "dc", time.Millisecond)
+			client := api.NewClient(server.URL, "", "0.1.0")
+			authorization, err := client.StartDeviceAuthorization(t.Context(), "Mac")
+			if err != nil {
+				server.Close()
+				t.Fatal(err)
+			}
+			_, err = client.PollDeviceToken(t.Context(), authorization, time.Millisecond)
 			server.Close()
 			if err == nil || !strings.Contains(err.Error(), code) {
 				t.Errorf("code=%s err=%v", code, err)

@@ -201,7 +201,7 @@ func (a *app) loginCommand() *cobra.Command {
 			pollContext, cancel := devicePollContext(cmd.Context(), authorization.ExpiresIn)
 			defer cancel()
 			interval := time.Duration(authorization.Interval) * time.Second
-			deviceToken, err := client.PollDeviceToken(pollContext, authorization.DeviceCode, interval)
+			deviceToken, err := client.PollDeviceToken(pollContext, authorization, interval)
 			if err != nil {
 				if pollContext.Err() == context.DeadlineExceeded {
 					return authError(errors.New("device authorization expired"))
@@ -215,7 +215,7 @@ func (a *app) loginCommand() *cobra.Command {
 			return err
 		},
 	}
-	login.Flags().BoolVar(&noBrowser, "no-browser", false, "Print the approval URL instead of opening a browser")
+	login.Flags().BoolVar(&noBrowser, "no-browser", false, "Suppress browser launch; still print approval instructions")
 	login.Flags().StringVar(&deviceName, "device-name", "", "Name of this device")
 	return login
 }

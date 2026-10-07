@@ -30,11 +30,15 @@ terminal.
 
 ## Server compatibility
 
-This CLI uses a device-authorization and API-key contract provided by Mailhub's
-[`backend`](https://github.com/private-mailhub/backend) service, with browser approval provided by
-[`frontend`](https://github.com/private-mailhub/frontend). The related backend and frontend pull
-requests add these server and approval flows. Until both changes are merged and deployed together,
-authentication, API-key, and alias commands cannot be used end-to-end against the production service.
+This CLI uses the device-authorization and API-key contract in Mailhub's
+[`backend` PR #67](https://github.com/private-mailhub/backend/pull/67), with browser approval from
+[`frontend` PR #4](https://github.com/private-mailhub/frontend/pull/4). The matching CLI change is in
+[`cli` PR #4](https://github.com/private-mailhub/cli/pull/4). The backend and CLI changes must be
+merged and deployed together: the CLI sends a poll-secret hash when it starts device authorization
+and proves possession of that secret on every token poll. The frontend PR provides the browser
+approval page. End-to-end login requires all three PR changes to be merged and deployed. Until then,
+authentication, API-key, and alias commands cannot be used end-to-end against the production
+service.
 
 Use those commands only with a Mailhub server that implements the contract above and accepts its API
 keys for the relay endpoints. `mailhub version`, `mailhub completion`, and local help work without a
@@ -136,11 +140,13 @@ The default flow opens the Mailhub approval page in your browser:
 mailhub auth login
 ```
 
-For a remote shell or a machine without a browser, print the URL and one-time code instead:
+To avoid launching a browser, such as from a remote shell, run the same login flow with:
 
 ```bash
 mailhub auth login --no-browser
 ```
+
+`--no-browser` suppresses browser launch; the CLI still prints the approval URL and one-time code.
 
 You can give the device a recognizable name:
 
@@ -149,7 +155,9 @@ mailhub auth login --device-name "Work Mac"
 ```
 
 Open the printed URL, sign in to Mailhub, approve the request, and return to the terminal. The CLI
-waits for approval and stores the resulting API key automatically.
+waits for approval and stores the resulting API key automatically. For each login, it creates a
+fresh random poll proof, sends only its SHA-256 hash with the device request, and presents the proof
+on each token poll. The proof stays in memory and is not printed.
 
 ### 2. Check authentication
 
@@ -196,13 +204,20 @@ API-key, and alias commands below require a compatible server; see
 | Command | Description |
 | --- | --- |
 | `mailhub auth login` | Authenticate the current device. |
-| `mailhub auth login --no-browser` | Print the approval URL instead of opening a browser. |
+| `mailhub auth login --no-browser` | Suppress browser launch while still printing the approval URL and one-time code. |
 | `mailhub auth login --device-name <name>` | Set the name shown on the approval page. |
 | `mailhub auth status` | Show the current key ID and expiry; with `MAILHUB_TOKEN`, report environment-based authentication only. |
 | `mailhub auth logout` | Revoke the current key; clear the Keychain credential only when it is the active credential. |
 | `mailhub auth keys list` | List API keys. |
 | `mailhub auth keys list --json` | List API keys as JSON. |
 | `mailhub auth keys revoke <key-id>` | Revoke one API key by ID. |
+
+Login creates a fresh random poll proof for each device authorization. The start request contains
+only the proof's SHA-256 hash; each token poll contains the same proof. The protocol is implemented
+by [backend PR #67](https://github.com/private-mailhub/backend/pull/67) and the corresponding
+[CLI PR #4](https://github.com/private-mailhub/cli/pull/4), which must be merged and deployed
+together. The browser approval page is provided by
+[frontend PR #4](https://github.com/private-mailhub/frontend/pull/4).
 
 ### Relay aliases
 

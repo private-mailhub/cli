@@ -79,3 +79,36 @@ func TestLogin_기본브라우저실행전에승인정보를출력한다(t *test
 		t.Fatalf("stderr=%q, want empty", stderr.String())
 	}
 }
+
+func TestLogin_HelpDescribesNoBrowserBehavior(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	application := &app{out: &stdout, errOut: &stderr}
+	root := application.rootCommand()
+	root.SetArgs([]string{"auth", "login", "--help"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("show login help: %v", err)
+	}
+
+	var noBrowserDescription string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		if strings.Contains(line, "--no-browser") {
+			noBrowserDescription = strings.ToLower(line)
+			break
+		}
+	}
+	blocksBrowser := strings.Contains(noBrowserDescription, "browser") &&
+		(strings.Contains(noBrowserDescription, "suppress") ||
+			strings.Contains(noBrowserDescription, "do not open") ||
+			strings.Contains(noBrowserDescription, "do not launch"))
+	keepsInstructions := strings.Contains(noBrowserDescription, "instruction") &&
+		strings.Contains(noBrowserDescription, "still") &&
+		strings.Contains(noBrowserDescription, "print")
+	if !blocksBrowser || !keepsInstructions {
+		t.Fatalf("--no-browser help should explain that it suppresses browser launch while instructions still print; line=%q full help=%q", noBrowserDescription, stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr=%q, want empty", stderr.String())
+	}
+}
