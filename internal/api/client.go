@@ -222,7 +222,7 @@ func NewClient(baseURL, token, version string) *Client {
 		baseURL = DefaultBaseURL
 	}
 	if version == "" {
-		version = "0.1.1"
+		version = "0.1.2"
 	}
 	return &Client{
 		baseURL:    baseURL,
@@ -621,7 +621,22 @@ func isHTTPSDowngrade(source, target *url.URL) bool {
 func sameOrigin(left, right *url.URL) bool {
 	return strings.EqualFold(left.Scheme, right.Scheme) &&
 		strings.EqualFold(left.Hostname(), right.Hostname()) &&
-		left.Port() == right.Port()
+		effectivePort(left) == effectivePort(right)
+}
+
+func effectivePort(parsedURL *url.URL) string {
+	if port := parsedURL.Port(); port != "" {
+		return port
+	}
+
+	switch strings.ToLower(parsedURL.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func isLoopbackHost(host string) bool {

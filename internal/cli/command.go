@@ -18,7 +18,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var Version = "0.1.1"
+var Version = "0.1.2"
 
 const (
 	ExitOK    = 0
