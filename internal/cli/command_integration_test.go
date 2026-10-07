@@ -30,7 +30,7 @@ func TestCommand_기본명령(t *testing.T) {
 	})
 	t.Run("version은 stdout에 버전을 출력하고 stderr는 비운다", func(t *testing.T) {
 		code, stdout, stderr := run(t, "version")
-		if code != 0 || stdout != "mailhub 0.1.0\n" || stderr != "" {
+		if code != 0 || stdout != "mailhub 0.1.1\n" || stderr != "" {
 			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
 		}
 	})
