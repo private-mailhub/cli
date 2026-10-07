@@ -7,3 +7,4 @@
 - Keep config files at mode 0600 in a mode 0700 `mailhub` directory and update them atomically.
 - Use `gofmt`, `go vet ./...`, `go test ./...`, and `go test -race ./...` before delivery.
 - Keep API calls behind `internal/api` and command validation/output behind `internal/cli`.
+- Write all code review feedback in English, including findings, explanations, summaries, and comments.
