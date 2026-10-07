@@ -1,8 +1,8 @@
 class Mailhub < Formula
   desc "Manage Mailhub relay addresses from the terminal"
   homepage "https://private-mailhub.com"
-  url "https://github.com/private-mailhub/cli/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "896a1e9d7e9a091583e3e6499092bc9647c6ef911d13e43398cb83d041412077"
+  url "https://github.com/private-mailhub/cli/archive/refs/tags/v0.1.2.tar.gz"
+  sha256 "0578c771aed7744354e53af8c19b7e0c9284bf5283442f2da9882fd64743582d"
   license "AGPL-3.0-or-later"
 
   depends_on "go" => :build
