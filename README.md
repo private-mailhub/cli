@@ -30,11 +30,11 @@ terminal.
 
 ## Server compatibility
 
-This CLI implements a device-authorization and API-key contract that the currently checked-out
-[`mailhub`](https://github.com/youngjinmo/mailhub) server does not implement. That server has no
-`/api/auth/cli/device`, `/api/auth/cli/device/token`, or `/api/api-keys` endpoints, and its relay
-endpoints accept browser JWTs rather than CLI API keys. As a result, authentication, API-key, and
-alias commands in this release cannot be used end-to-end against that server.
+This CLI uses a device-authorization and API-key contract provided by Mailhub's
+[`backend`](https://github.com/private-mailhub/backend) service, with browser approval provided by
+[`client-web`](https://github.com/private-mailhub/client-web). The related backend and frontend pull
+requests add these server and approval flows. Until both changes are merged and deployed together,
+authentication, API-key, and alias commands cannot be used end-to-end against the production service.
 
 Use those commands only with a Mailhub server that implements the contract above and accepts its API
 keys for the relay endpoints. `mailhub version`, `mailhub completion`, and local help work without a
