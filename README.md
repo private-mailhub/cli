@@ -25,7 +25,7 @@
 device through the browser, then manage relay email aliases and API keys without leaving your
 terminal.
 
-> **Early release:** the current CLI version is `0.1.0`. The supported release targets are macOS
+> **Early release:** the current CLI version is `0.1.1`. The supported release targets are macOS
 > Apple Silicon (`arm64`) and Intel (`amd64`).
 
 ## Server compatibility
@@ -33,12 +33,11 @@ terminal.
 This CLI uses the device-authorization and API-key contract in Mailhub's
 [`backend` PR #67](https://github.com/private-mailhub/backend/pull/67), with browser approval from
 [`frontend` PR #4](https://github.com/private-mailhub/frontend/pull/4). The matching CLI change is in
-[`cli` PR #4](https://github.com/private-mailhub/cli/pull/4). The backend and CLI changes must be
-merged and deployed together: the CLI sends a poll-secret hash when it starts device authorization
-and proves possession of that secret on every token poll. The frontend PR provides the browser
-approval page. End-to-end login requires all three PR changes to be merged and deployed. Until then,
-authentication, API-key, and alias commands cannot be used end-to-end against the production
-service.
+[`cli` PR #4](https://github.com/private-mailhub/cli/pull/4). The current backend contract requires
+CLI version `0.1.1` or newer: this version sends a poll-secret hash when it starts device
+authorization and proves possession of that secret on every token poll. Homebrew users with version
+`0.1.0` must upgrade with `brew upgrade mailhub` before running `mailhub auth login`. End-to-end login
+also requires the frontend approval page from PR #4 to be deployed.
 
 Use those commands only with a Mailhub server that implements the contract above and accepts its API
 keys for the relay endpoints. `mailhub version`, `mailhub completion`, and local help work without a

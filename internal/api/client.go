@@ -222,7 +222,7 @@ func NewClient(baseURL, token, version string) *Client {
 		baseURL = DefaultBaseURL
 	}
 	if version == "" {
-		version = "0.1.0"
+		version = "0.1.1"
 	}
 	return &Client{
 		baseURL:    baseURL,
