@@ -69,3 +69,22 @@ jobs:
         with:
           name: mailhub-darwin-amd64
           path: dist/mailhub-darwin-amd64
+
+  homebrew:
+    name: homebrew
+    runs-on: macos-15
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tap current checkout
+        run: brew tap private-mailhub/cli "file://$GITHUB_WORKSPACE"
+      - name: Trust formula
+        run: brew trust --formula private-mailhub/cli/mailhub
+      - name: Audit formula
+        run: brew audit --strict private-mailhub/cli/mailhub
+      - name: Build formula
+        run: brew install --build-from-source private-mailhub/cli/mailhub
+      - name: Test formula
+        run: brew test private-mailhub/cli/mailhub
