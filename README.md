@@ -71,6 +71,15 @@ server.
 
 ## Install
 
+### Install with Homebrew
+
+Homebrew builds the CLI from the tagged Go source for your Mac:
+
+```bash
+brew install private-mailhub/tap/mailhub
+mailhub version
+```
+
 ### Build from source
 
 Clone the repository and build the binary:
@@ -94,8 +103,8 @@ go install github.com/private-mailhub/mailhub-cli/cmd/mailhub@main
 mailhub version
 ```
 
-Prebuilt binaries and a Homebrew tap are not published yet. Build from source until release
-artifacts are available.
+Prebuilt binaries are not published. Homebrew builds from source; you can also build or install the
+CLI with Go directly.
 
 ## Quick start
 
